@@ -19,9 +19,10 @@ __global__ void inclusive_scan_kernel_naive(const T *X, T *output, const int siz
   } else {
     sX[threadIdx.x] = 0.0f;
   }
-  __syncthreads();
 
   for (uint stride = 1; stride < size; stride *= 2) {
+    // all threads must update their SMEM before we can move on to the next wave
+    __syncthreads();
 
     // Accumulate this stage into register to avoid race condition from other threads reading this value
     float acc;
@@ -33,12 +34,9 @@ __global__ void inclusive_scan_kernel_naive(const T *X, T *output, const int siz
     __syncthreads();
     if (threadIdx.x >= stride) 
       sX[threadIdx.x] = acc;
-    // all threads must update their SMEM before we can move on to the next wave
-    __syncthreads();
   }
 
-
-  // Write output
+  // Write output. No need for syncing as each thread only reads its own value
   if (i < size) {
     output[i] = sX[threadIdx.x];
   }
