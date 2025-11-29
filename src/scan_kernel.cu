@@ -56,17 +56,16 @@ __global__ void inclusive_scan_kernel_naive_single_block_coarse(const size_t *X,
   Parallel scan on local sums:  0 6 28
   Increment each local chunk by the local sums: 0 1 3 6 | 10 15 21 28 | 34 ...
   */
-
-  constexpr int NUM_ITERS = COARSE_FACTOR;
   constexpr int NUM_THREADS = BLOCK_SIZE / COARSE_FACTOR;
   uint i = blockIdx.x * blockDim.x + threadIdx.x;  
 
-  __shared__ float sX[BLOCK_SIZE];
-  __shared__ float sLocalSums[NUM_THREADS];
+  __shared__ size_t sX[BLOCK_SIZE];
+  __shared__ size_t sLocalSums[NUM_THREADS];
+  size_t rX[COARSE_FACTOR];
 
   // 0. Cooperatively load from GMEM in coalesced fashion
 #pragma unroll
-  for (uint iter = 0; iter < NUM_ITERS; ++iter) {
+  for (uint iter = 0; iter < COARSE_FACTOR; ++iter) {
     int idx = NUM_THREADS * iter + i;
     sX[idx] = X[idx];
   }
@@ -74,7 +73,6 @@ __global__ void inclusive_scan_kernel_naive_single_block_coarse(const size_t *X,
 
   // 1. Local sequential scan on each thread's section in regs
   // first copy local values into regs
-  float rX[COARSE_FACTOR];
 
   // This loop could be vectorized
 #pragma unroll
@@ -95,12 +93,11 @@ __global__ void inclusive_scan_kernel_naive_single_block_coarse(const size_t *X,
   }
 
   // 2. Perform regular parallel scan (non-coarse) on the local sums
-  // This could also be done using parallel scan, but we skip it here
 #pragma unroll
   for (uint stride = 1; stride < NUM_THREADS; stride *= 2) {
     __syncthreads();
 
-    float acc;
+    size_t acc;
     if (threadIdx.x >= stride) {
       acc = sLocalSums[threadIdx.x] + sLocalSums[threadIdx.x - stride];
     }
@@ -122,6 +119,3 @@ __global__ void inclusive_scan_kernel_naive_single_block_coarse(const size_t *X,
   }
 }
 
-template<typename size_t>
-__global__ void inclusive_scan_kernel_naive_single_block_coarse_vectorized(const size_t *X, size_t *output, const int size) {
-}
