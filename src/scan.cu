@@ -18,7 +18,11 @@ at::Tensor inclusive_scan(const at::Tensor& input) {
   float* output_data = output.data_ptr<float>();
   int size = input.size(0);
 
-  inclusive_scan_kernel_naive<float><<<cdiv(size, BLOCK_SIZE), BLOCK_SIZE>>>(input_data, output_data, size);
+  //inclusive_scan_kernel_naive_single_block<float><<<cdiv(size, BLOCK_SIZE), BLOCK_SIZE>>>(input_data, output_data, size);
+
+  // Note: Currently only handles size <= BLOCK_SIZE
+  const int threads_per_block_coarse = BLOCK_SIZE / COARSE_FACTOR;
+  inclusive_scan_kernel_naive_single_block_coarse<float><<<1, threads_per_block_coarse>>>(input_data, output_data, size);
 
   return output.to(torch::kCPU);
 }
