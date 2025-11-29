@@ -8,6 +8,9 @@ default:
 
 	cmake --build build -j --config Release
 
+memcheck: 
+	compute-sanitizer --tool memcheck ./build/scan
+
 ncu:
 	sudo /usr/local/cuda/bin/ncu ./build/scan
 
