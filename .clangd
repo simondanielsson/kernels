@@ -1,0 +1,8 @@
+CompileFlags:
+  Add:
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_89
+If:
+  PathMatch: .*\.(cu|cuh)$
+  CompileFlags:
+    Add: [ -x, cuda ]
