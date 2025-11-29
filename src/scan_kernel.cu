@@ -45,20 +45,16 @@ __global__ void inclusive_scan_kernel_naive_single_block(const size_t *X, size_t
 
 template<typename size_t>
 __global__ void inclusive_scan_kernel_naive_single_block_coarse(const size_t *X, size_t *output, const int size) {
-  // Each thread is responsible for computing the result on COARSE_FACTOR threads.
+  // 
   /*
-  Say BLOCK_SIZE = 256
-  COARSE_FACTOR = 4
-  We launch 256 / 4 = 64 threads
-  We cover 256 data elements with these, so we must run 4 load iterations
+  Each thread is responsible for computing the result on COARSE_FACTOR threads.
 
-  0 1 2 3 | 4 5 6 7 | 8 9 10 11
-  0 1 3 6 | 4 9 15 22 | 8 17 27 38
-
-  0 6 22 
-  0 6 28
-
-  0 1 3 6 | 10 15 21 28 | 34 ...
+  Steps:
+  Input:                  0 1 2 3 | 4 5 6 7 | 8 9 10 11
+  Local sequential scan:  0 1 3 6 | 4 9 15 22 | 8 17 27 38
+  Load local sums:              0 6 22 
+  Parallel scan on local sums:  0 6 28
+  Increment each local chunk by the local sums: 0 1 3 6 | 10 15 21 28 | 34 ...
   */
 
   constexpr int NUM_ITERS = COARSE_FACTOR;
