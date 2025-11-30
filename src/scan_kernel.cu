@@ -1,6 +1,8 @@
+#include <torch/torch.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#define cdiv(a, b) ((a + b - 1) / b)
 #define WARP_SIZE 32
 #define BLOCK_SIZE 256
 #define COARSE_FACTOR 4
@@ -119,3 +121,97 @@ __global__ void inclusive_scan_kernel_naive_single_block_coarse(const size_t *X,
   }
 }
 
+
+template<typename size_t>
+__global__ void inclusive_scan_kernel_kogge_stone_block_local_dubble_buffering(const size_t *X, size_t *output, const int size) {
+  uint gtid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  __shared__ float sX[2*BLOCK_SIZE];
+
+  // Each thread loads one element from GMEM
+  if (gtid < size) {
+    sX[threadIdx.x] = X[gtid];
+  } else {
+    sX[threadIdx.x] = 0.0f;
+  }
+
+  // In dubble buffering, the "active" portion of SMEM is swapped every iteration
+  uint offset;
+  uint last_i = 0;
+  for (uint stride = 1, i = 0; stride < size; stride *= 2, ++i) {
+    __syncthreads();
+    offset = BLOCK_SIZE * (i % 2);
+
+    // Read from one chunk of the SMEM, and write to the other
+    if (threadIdx.x >= stride) {
+      sX[BLOCK_SIZE * ((i+1) % 2) + threadIdx.x] = sX[offset + threadIdx.x] + sX[offset + threadIdx.x - stride];
+    }
+    if (stride*2 >= size) 
+      last_i = i;
+  }
+
+  // If last i was even, then we wrote the last values to the second half
+  __syncthreads();
+  if (gtid < size) {
+    offset = BLOCK_SIZE * ((last_i+1) % 2);
+    output[gtid] = sX[offset + threadIdx.x];
+  }
+}
+
+template<typename size_t, const int block_size>
+__global__ void inclusive_scan_kernel_kogge_stone_block_local(const size_t *X, size_t *output, const int size, int logical_stride) {
+  // logical stride allows us to perform scan on every logical_stride'th element
+  const int logical_offset = logical_stride - 1;
+  const int logical_coarsening = logical_stride;
+  uint gtid = (blockIdx.x * block_size + threadIdx.x) * logical_coarsening + logical_offset;
+
+  __shared__ float sX[block_size];
+
+  // Each thread loads one element from GMEM
+  if (gtid < size) {
+    sX[threadIdx.x] = X[gtid];
+  } else {
+    sX[threadIdx.x] = 0.0f;
+  }
+
+  for (uint stride = 1; stride < block_size; stride *= 2) {
+    __syncthreads();
+
+    float acc;
+    if (threadIdx.x >= stride) {
+      acc = sX[threadIdx.x] + sX[threadIdx.x - stride];
+    }
+
+    __syncthreads();
+    if (threadIdx.x >= stride) 
+      sX[threadIdx.x] = acc;
+  }
+
+  if (gtid < size) {
+    output[gtid] = sX[threadIdx.x];
+  }
+}
+
+template <typename size_t, const int block_size>
+__global__ void inclusive_scan_update_blocks_with_offsets(size_t* output, int size) {
+  // Last element in each block is now updated. Remains to update the other elements (sequentially) per block with the left-adjacent block sum
+  const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+  const int last_block_idx = blockIdx.x - 1;
+  if (last_block_idx >= 0) {
+    if ((gtid < size) && (threadIdx.x < blockDim.x - 1)) {
+      output[gtid] += output[last_block_idx*blockDim.x + block_size - 1];
+    }
+  }
+}
+
+template<typename size_t>
+void inclusive_scan_kernel_kogge_stone_3_stage(const size_t* X, size_t* output, const int size) {
+  constexpr int num_blocks = cdiv(8192, BLOCK_SIZE);
+  // constexpr int num_blocks = cdiv(256, BLOCK_SIZE);
+  // Compute local scans in each block
+  inclusive_scan_kernel_kogge_stone_block_local<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(X, output, size, 1);
+  // Compute a scan on the last element of each block, across original blocks
+  inclusive_scan_kernel_kogge_stone_block_local<size_t, num_blocks><<<1, num_blocks>>>(output, output, size, BLOCK_SIZE);
+  // Output remaining elements with the offsets
+  inclusive_scan_update_blocks_with_offsets<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(output, size);
+}
