@@ -12,7 +12,7 @@ memcheck:
 	compute-sanitizer --tool memcheck ./build/scan
 
 ncu:
-	sudo /usr/local/cuda/bin/ncu ./build/scan
+	sudo /usr/local/cuda/bin/ncu -fo scan_profile --set full --target-processes all build/scan
 
 nsys:
 	nsys profile --stats=true build/scan
