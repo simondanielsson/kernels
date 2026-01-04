@@ -7,8 +7,7 @@
 #define NUM_BLOCKS_M 32
 #define NUM_BLOCKS_K 32
 
-#define THREADS_PER_BLOCK_M 32
-#define THREADS_PER_BLOCK_K 32
+#define BLOCK_SIZE 32
 
 #define checkCuda(val) check((val), #val, __FILE__, __LINE__)
 void check(cudaError_t err, const char* const func, const char* const file,
@@ -46,20 +45,47 @@ void __global__ gemm_v1(int M, int N, int K, const float* A, const float* B, flo
 
 // V2: Shared memory
 void __global__ gemm_v2(int M, int N, int K, const float* A, const float* B, float* C, int lda, int ldb, int ldc) {
-  int col_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int row_idx = blockIdx.y * blockDim.y + threadIdx.y;
+  __shared__ float sA[BLOCK_SIZE][BLOCK_SIZE];
+  __shared__ float sB[BLOCK_SIZE][BLOCK_SIZE];
 
-  // grid loop
-  while (col_idx < N && row_idx < M) {
+  // grid-stride using the block index, striding by the total number of blocks per direction
+  for (int by = blockIdx.y; by * BLOCK_SIZE < M; by += gridDim.y) {
+    for (int bx = blockIdx.x; bx * BLOCK_SIZE < N; bx += gridDim.x) {
+      int grow = by * BLOCK_SIZE + threadIdx.y;
+      int gcol = bx * BLOCK_SIZE + threadIdx.x;
 
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-      acc += A[row_idx * lda + k] * B[k * ldb + col_idx];
+      float acc = 0.0f;
+
+      // split the original k-loop into tiles
+      for (int k_tile_start = 0; k_tile_start < K; k_tile_start += BLOCK_SIZE) {
+        // local tile indices 
+        int k_col = k_tile_start + threadIdx.x;
+        int k_row = k_tile_start + threadIdx.y;
+
+        // cooperatively load a tile into SMEM. each thread loads one element from A and B
+        // This way each thread only issues K/BLOCK_SIZE GMEM loads rather than K.
+        sA[threadIdx.y][threadIdx.x] = 
+          (k_col < K && grow < M)
+          ? A[grow * lda + k_col] 
+          : 0.0f;
+        sB[threadIdx.y][threadIdx.x] = 
+          (k_row < K && gcol < N)
+          ? B[k_row * ldb + gcol]
+          : 0.0f;
+        __syncthreads();
+
+        // k-tile (partial) accumulation. Could remove some loop iterations in edges
+#pragma unroll
+        for (int k = 0; k < BLOCK_SIZE; ++k)
+          acc += sA[threadIdx.y][k] * sB[k][threadIdx.x];
+
+        // required to avoid writing in the next loop too early
+        __syncthreads();
+      }
+      if (gcol < N && grow < M) {
+        C[grow*ldc + gcol] = acc;
+      }
     }
-    C[row_idx*ldc + col_idx] = acc;
-
-    row_idx += gridDim.y;
-    col_idx += gridDim.x;
   }
 }
 
@@ -91,8 +117,9 @@ at::Tensor gemm(const at::Tensor& A_h, const at::Tensor& B_h) {
   checkCuda(cudaStreamCreate(&stream));
 
   dim3 blocks(NUM_BLOCKS_M, NUM_BLOCKS_K, 1);
-  dim3 threads(THREADS_PER_BLOCK_M, THREADS_PER_BLOCK_K, 1);
-  gemm_v1<<<blocks, threads, 0, stream>>>(M, N, K, A_d, B_d, C_d, lda, ldb, ldc);
+  dim3 threads(BLOCK_SIZE, BLOCK_SIZE, 1);
+  // gemm_v1<<<blocks, threads, 0, stream>>>(M, N, K, A_d, B_d, C_d, lda, ldb, ldc);
+  gemm_v2<<<blocks, threads, 0, stream>>>(M, N, K, A_d, B_d, C_d, lda, ldb, ldc);
 
   // Sync as device and host code otherwise runs asynchronously
   cudaError_t err{cudaGetLastError()};
@@ -116,7 +143,7 @@ at::Tensor reference_gemm(const at::Tensor& A, const at::Tensor& B) {
   TORCH_CHECK(!A.is_cuda(), "input expects CPU tensor");
   TORCH_CHECK(!B.is_cuda(), "input expects CPU tensor");
 
-  auto C_ref64 = torch::matmul(A_cpu.to(torch::kFloat64), B_cpu.to(torch::kFloat64));
+  auto C_ref64 = torch::matmul(A.to(torch::kFloat64), B.to(torch::kFloat64));
   return C_ref64.to(torch::kFloat32);
 }
 
@@ -134,8 +161,10 @@ int run_tests(uint n) {
     std::cout << "OK" << std::endl;
   } else {
     std::cout << "Failed" << std::endl;
-    // std::cout << C_ref << std::endl;
-    // std::cout << C << std::endl;
+    if (n <= 16) {
+      std::cout << C_ref << std::endl;
+      std::cout << C << std::endl;
+    }
     return 1;
   }
   return 0;
