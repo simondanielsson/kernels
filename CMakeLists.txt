@@ -22,5 +22,13 @@ add_executable(scan src/main.cu)
 target_link_libraries(scan scan_lib)
 set_property(TARGET scan PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 
+add_executable(gemm src/gemm.cu)
+target_link_libraries(gemm "${TORCH_LIBRARIES}")
+# Line info for source-level profiling (Nsight Systems/Compute)
+target_compile_options(gemm PRIVATE
+  "$<$<COMPILE_LANGUAGE:CUDA>:--generate-line-info>"
+)
+
 # If you need extra options for NVCC, add them guarded for CUDA language:
 # target_compile_options(vec_add PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>")
+

@@ -6,7 +6,7 @@ default:
 		-DCMAKE_PREFIX_PATH=/home/danielssonsimon/libtorch \
 		-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
-	cmake --build build -j --config Release
+	cmake --build build -j --config Release --target gemm
 
 memcheck: 
 	compute-sanitizer --tool memcheck ./build/scan
