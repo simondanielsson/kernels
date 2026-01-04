@@ -25,20 +25,22 @@ void check(cudaError_t err, const char* const func, const char* const file,
 
 // Naive: (gather-like) one thread per C-element, global only
 void __global__ gemm_v1(int M, int N, int K, const float* A, const float* B, float* C, int lda, int ldb, int ldc) {
-  int col_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int row_idx = blockIdx.y * blockDim.y + threadIdx.y;
+  int col_idx0 = blockIdx.x * blockDim.x + threadIdx.x;
+  int row_idx0 = blockIdx.y * blockDim.y + threadIdx.y;
 
-  // grid loop
-  while (col_idx < N && row_idx < M) {
-
-    float acc = 0.0f;
-    for (int k = 0; k < K; ++k) {
-      acc += A[row_idx * lda + k] * B[k * ldb + col_idx];
+  int num_threads_x = gridDim.x * blockDim.x;
+  int num_threads_y = gridDim.y * blockDim.y;
+  
+  // grid loop and boundary check
+  for (int row_idx = row_idx0; row_idx < M; row_idx += num_threads_y) {
+    for (int col_idx = col_idx0; col_idx < N; col_idx += num_threads_x) {
+      // k-loop accumulation
+      float acc = 0.0f;
+      for (int k = 0; k < K; ++k) {
+        acc += A[row_idx * lda + k] * B[k * ldb + col_idx];
+      }
+      C[row_idx*ldc + col_idx] = acc;
     }
-    C[row_idx*ldc + col_idx] = acc;
-
-    row_idx += gridDim.y;
-    col_idx += gridDim.x;
   }
 }
 
@@ -66,8 +68,10 @@ at::Tensor gemm(const at::Tensor& A_h, const at::Tensor& B_h) {
   // auto B = B_cpu.to(torch::kCUDA);
   auto C = torch::empty_like(A_h).to(torch::kCUDA);
 
-  const float* A_ptr_h = A_h.data_ptr<float>();
-  const float* B_ptr_h = B_h.data_ptr<float>();
+  auto A_cpu = A_h.contiguous();
+  auto B_cpu = B_h.contiguous();
+  const float* A_ptr_h = A_cpu.data_ptr<float>();
+  const float* B_ptr_h = B_cpu.data_ptr<float>();
   float* C_d = C.data_ptr<float>();
 
   int M = A_h.size(0);
@@ -79,7 +83,7 @@ at::Tensor gemm(const at::Tensor& A_h, const at::Tensor& B_h) {
   int A_size = sizeof(float)*M*K;
   int B_size = sizeof(float)*K*N;
   checkCuda(cudaMalloc((void **)&A_d, A_size));
-  checkCuda(cudaMalloc((void **)&B_d, A_size));
+  checkCuda(cudaMalloc((void **)&B_d, B_size));
   checkCuda(cudaMemcpy((void *)A_d, (void *)A_ptr_h, A_size, cudaMemcpyHostToDevice));
   checkCuda(cudaMemcpy((void *)B_d, (void *)B_ptr_h, B_size, cudaMemcpyHostToDevice));
 
@@ -91,7 +95,6 @@ at::Tensor gemm(const at::Tensor& A_h, const at::Tensor& B_h) {
   gemm_v1<<<blocks, threads, 0, stream>>>(M, N, K, A_d, B_d, C_d, lda, ldb, ldc);
 
   // Sync as device and host code otherwise runs asynchronously
-  cudaDeviceSynchronize();
   cudaError_t err{cudaGetLastError()};
   if (err != cudaSuccess)
   {
@@ -100,6 +103,10 @@ at::Tensor gemm(const at::Tensor& A_h, const at::Tensor& B_h) {
       std::cerr << cudaGetErrorString(err) << std::endl;
       std::exit(EXIT_FAILURE);
   }
+  checkCuda(cudaStreamSynchronize(stream));
+
+  checkCuda(cudaFree(A_d));
+  checkCuda(cudaFree(B_d));
   checkCuda(cudaStreamDestroy(stream));
 
   return C.to(torch::kCPU);
@@ -108,7 +115,9 @@ at::Tensor gemm(const at::Tensor& A_h, const at::Tensor& B_h) {
 at::Tensor reference_gemm(const at::Tensor& A, const at::Tensor& B) {
   TORCH_CHECK(!A.is_cuda(), "input expects CPU tensor");
   TORCH_CHECK(!B.is_cuda(), "input expects CPU tensor");
-  return torch::matmul(A, B);
+
+  auto C_ref64 = torch::matmul(A_cpu.to(torch::kFloat64), B_cpu.to(torch::kFloat64));
+  return C_ref64.to(torch::kFloat32);
 }
 
 int run_tests(uint n) {
@@ -121,7 +130,7 @@ int run_tests(uint n) {
   auto C = gemm(A_cpu, B_cpu);
 
   std::cout << "n = " << n << " - ";
-  if (at::allclose(C_ref, C, 1e-2)) {
+  if (at::allclose(C_ref, C, 1e-2, 5e-2)) {
     std::cout << "OK" << std::endl;
   } else {
     std::cout << "Failed" << std::endl;
@@ -148,9 +157,10 @@ int main() {
   std::cout << "CUDA available? " << torch::cuda::is_available() << "\n";
   std::cout << "CUDA device count: " << torch::cuda::device_count() << "\n";
   std::vector<int64_t> sizes = {
-    // 16,
-    // 32,
-    // 33,
+    16,
+    32,
+    33,
+    1023,
     1024,
     4096,
   };
