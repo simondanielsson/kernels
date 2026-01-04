@@ -8,6 +8,7 @@
 #define NUM_BLOCKS_K 32
 
 #define BLOCK_SIZE 32
+#define TM 8
 
 #define checkCuda(val) check((val), #val, __FILE__, __LINE__)
 void check(cudaError_t err, const char* const func, const char* const file,
@@ -22,7 +23,8 @@ void check(cudaError_t err, const char* const func, const char* const file,
     }
 }
 
-// Naive: (gather-like) one thread per C-element, global only
+// V1 Naive: (gather-like) one thread per C-element, global only
+// This kernel has lots of LG throttle, meaning it spends most of its clock cycles waiting for the global load queue to not be full
 void __global__ gemm_v1(int M, int N, int K, const float* A, const float* B, float* C, int lda, int ldb, int ldc) {
   int col_idx0 = blockIdx.x * blockDim.x + threadIdx.x;
   int row_idx0 = blockIdx.y * blockDim.y + threadIdx.y;
@@ -44,6 +46,8 @@ void __global__ gemm_v1(int M, int N, int K, const float* A, const float* B, flo
 }
 
 // V2: Shared memory
+// This solves the issues with global memory stalls, but instead causes MIO pipeline stalls.
+// This kernel spends a lot of time loading data from shared memory, causing the number of eligible warps to be extremely low
 void __global__ gemm_v2(int M, int N, int K, const float* A, const float* B, float* C, int lda, int ldb, int ldc) {
   __shared__ float sA[BLOCK_SIZE][BLOCK_SIZE];
   __shared__ float sB[BLOCK_SIZE][BLOCK_SIZE];
@@ -55,22 +59,17 @@ void __global__ gemm_v2(int M, int N, int K, const float* A, const float* B, flo
       int gcol = bx * BLOCK_SIZE + threadIdx.x;
 
       float acc = 0.0f;
-
       // split the original k-loop into tiles
       for (int k_tile_start = 0; k_tile_start < K; k_tile_start += BLOCK_SIZE) {
-        // local tile indices 
-        int k_col = k_tile_start + threadIdx.x;
-        int k_row = k_tile_start + threadIdx.y;
-
         // cooperatively load a tile into SMEM. each thread loads one element from A and B
         // This way each thread only issues K/BLOCK_SIZE GMEM loads rather than K.
         sA[threadIdx.y][threadIdx.x] = 
-          (k_col < K && grow < M)
-          ? A[grow * lda + k_col] 
+          (k_tile_start + threadIdx.x < K && grow < M)
+          ? A[grow * lda + k_tile_start + threadIdx.x] 
           : 0.0f;
         sB[threadIdx.y][threadIdx.x] = 
-          (k_row < K && gcol < N)
-          ? B[k_row * ldb + gcol]
+          (k_tile_start + threadIdx.y < K && gcol < N)
+          ? B[(k_tile_start + threadIdx.y) * ldb + gcol]
           : 0.0f;
         __syncthreads();
 
@@ -86,6 +85,59 @@ void __global__ gemm_v2(int M, int N, int K, const float* A, const float* B, flo
         C[grow*ldc + gcol] = acc;
       }
     }
+  }
+}
+
+
+// V3: block tiling for each thread to calculates a column of output tile elements 
+// This way we can reuse the data in the B tile column for each thread, reducing the SMEM load pressure.
+void __global__ gemm_v3(int M, int N, int K, const float* A, const float* B, float* C, int lda, int ldb, int ldc) {
+  // constexpr int NUM_BLOCKTILES = (BLOCK_SIZE + TM - 1) / TM;
+
+  __shared__ float sA[BLOCK_SIZE][BLOCK_SIZE];
+  __shared__ float sB[BLOCK_SIZE][BLOCK_SIZE];
+
+  int tile_row = blockIdx.y * BLOCK_SIZE;
+  int grow = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+  int gcol = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+  // store in a coarsened fashion 
+  int out_row0 = tile_row + threadIdx.y * TM;
+
+  // Hold all accumulated values
+  float acc[TM] = {0.0f};
+  for (int k_tile_start = 0; k_tile_start < K; k_tile_start += BLOCK_SIZE) {
+    sA[threadIdx.y][threadIdx.x] = 
+      (k_tile_start + threadIdx.x < K && grow < M)
+      ? A[grow * lda + k_tile_start + threadIdx.x] 
+      : 0.0f;
+    sB[threadIdx.y][threadIdx.x] = 
+      (k_tile_start + threadIdx.y < K && gcol < N)
+      ? B[(k_tile_start + threadIdx.y) * ldb + gcol]
+      : 0.0f;
+    __syncthreads();
+
+    // Block tiling loop: block tiles are size (TM x BLOCK_SIZE)
+    // In each block tile we can accumulate the values for each of the TM outputs value
+#pragma unroll
+    for (int bk = 0; bk < BLOCK_SIZE; ++bk) { // k-loop accumulation over "outer products"
+      // loop swapping enables us to cache the B value in a register
+      float B_val = sB[bk][threadIdx.x];
+#pragma unroll
+      for (int tm = 0; tm < TM; ++tm) { // for each coarsened row
+        if (threadIdx.y*TM + tm < BLOCK_SIZE) { // deactivate out of bounds threads
+          // coarsen by TM on the rows
+          acc[tm] += sA[threadIdx.y*TM + tm][bk] * B_val;
+        }
+      }
+    }
+    __syncthreads();
+  }
+  for (int tm = 0; tm < TM; ++tm) {
+    int out_row = out_row0 + tm;
+    // ensure we don't accidentally override with 0s from deactivated threads
+    int tile_row = threadIdx.y*TM + tm;
+    if (tile_row < BLOCK_SIZE && gcol < N && out_row < M) 
+      C[out_row * ldc + gcol] = acc[tm];
   }
 }
 
@@ -118,8 +170,12 @@ at::Tensor gemm(const at::Tensor& A_h, const at::Tensor& B_h) {
 
   dim3 blocks(NUM_BLOCKS_M, NUM_BLOCKS_K, 1);
   dim3 threads(BLOCK_SIZE, BLOCK_SIZE, 1);
-  // gemm_v1<<<blocks, threads, 0, stream>>>(M, N, K, A_d, B_d, C_d, lda, ldb, ldc);
+  gemm_v1<<<blocks, threads, 0, stream>>>(M, N, K, A_d, B_d, C_d, lda, ldb, ldc);
   gemm_v2<<<blocks, threads, 0, stream>>>(M, N, K, A_d, B_d, C_d, lda, ldb, ldc);
+
+  dim3 blocks_v3((M + BLOCK_SIZE - 1) / BLOCK_SIZE, (N + BLOCK_SIZE - 1) / BLOCK_SIZE, 1);
+  dim3 threads_v3(BLOCK_SIZE, BLOCK_SIZE, 1);
+  gemm_v3<<<blocks_v3, threads_v3, 0, stream>>>(M, N, K, A_d, B_d, C_d, lda, ldb, ldc);
 
   // Sync as device and host code otherwise runs asynchronously
   cudaError_t err{cudaGetLastError()};
@@ -186,11 +242,11 @@ int main() {
   std::cout << "CUDA available? " << torch::cuda::is_available() << "\n";
   std::cout << "CUDA device count: " << torch::cuda::device_count() << "\n";
   std::vector<int64_t> sizes = {
-    16,
-    32,
-    33,
-    1023,
-    1024,
+    // 16,
+    // 32,
+    // 33,
+    // 1023,
+    // 1024,
     4096,
   };
 
