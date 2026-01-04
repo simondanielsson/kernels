@@ -4,7 +4,7 @@
 
 #define cdiv(a, b) ((a + b - 1) / b)
 #define WARP_SIZE 32
-#define BLOCK_SIZE 256
+#define BLOCK_SIZE 1024
 #define COARSE_FACTOR 4
 
 template<typename size_t>
@@ -122,11 +122,14 @@ __global__ void inclusive_scan_kernel_naive_single_block_coarse(const size_t *X,
 }
 
 
-template<typename size_t>
-__global__ void inclusive_scan_kernel_kogge_stone_block_local_dubble_buffering(const size_t *X, size_t *output, const int size) {
-  uint gtid = blockIdx.x * blockDim.x + threadIdx.x;
+template<typename size_t, const int block_size>
+__global__ void inclusive_scan_kernel_kogge_stone_block_local_double_buffering(const size_t *X, size_t *output, const int size, const int logical_stride) {
+  // logical stride allows us to perform scan on every logical_stride'th element
+  const int logical_offset = logical_stride - 1;
+  const int logical_coarsening = logical_stride;
+  uint gtid = (blockIdx.x * block_size + threadIdx.x) * logical_coarsening + logical_offset;
 
-  __shared__ float sX[2*BLOCK_SIZE];
+  __shared__ float sX[2*block_size];
 
   // Each thread loads one element from GMEM
   if (gtid < size) {
@@ -135,25 +138,40 @@ __global__ void inclusive_scan_kernel_kogge_stone_block_local_dubble_buffering(c
     sX[threadIdx.x] = 0.0f;
   }
 
-  // In dubble buffering, the "active" portion of SMEM is swapped every iteration
-  uint offset;
+  // In double buffering, the "active" portion of SMEM is swapped every iteration
+  uint offset = 0;
   uint last_i = 0;
-  for (uint stride = 1, i = 0; stride < size; stride *= 2, ++i) {
-    __syncthreads();
-    offset = BLOCK_SIZE * (i % 2);
+  // for (uint stride = 1, i = 0; stride < block_size; stride *= 2, ++i) {
+  //   __syncthreads();
+  //   offset = block_size * (i % 2);
+  //
+  //   // Read from one chunk of the SMEM, and write to the other
+  //   if (threadIdx.x >= stride) {
+  //     sX[block_size * ((i+1) % 2) + threadIdx.x] = sX[offset + threadIdx.x] + sX[offset + threadIdx.x - stride];
+  //   }
+  //   if (stride*2 >= block_size) 
+  //     last_i = i;
+  // }
 
-    // Read from one chunk of the SMEM, and write to the other
+  for (uint stride = 1, i = 0; stride < block_size; stride <<= 1, ++i) {
+    __syncthreads();
+    uint src_offset = block_size * (i % 2);
+    uint dst_offset = block_size * ((i + 1) % 2);
+
+    size_t val = sX[src_offset + threadIdx.x];
     if (threadIdx.x >= stride) {
-      sX[BLOCK_SIZE * ((i+1) % 2) + threadIdx.x] = sX[offset + threadIdx.x] + sX[offset + threadIdx.x - stride];
+      val += sX[src_offset + threadIdx.x - stride];
     }
-    if (stride*2 >= size) 
+    sX[dst_offset + threadIdx.x] = val;
+
+    if (stride * 2 >= block_size)
       last_i = i;
   }
 
   // If last i was even, then we wrote the last values to the second half
   __syncthreads();
   if (gtid < size) {
-    offset = BLOCK_SIZE * ((last_i+1) % 2);
+    offset = block_size * ((last_i+1) % 2);
     output[gtid] = sX[offset + threadIdx.x];
   }
 }
@@ -206,12 +224,43 @@ __global__ void inclusive_scan_update_blocks_with_offsets(size_t* output, int si
 
 template<typename size_t>
 void inclusive_scan_kernel_kogge_stone_3_stage(const size_t* X, size_t* output, const int size) {
-  constexpr int num_blocks = cdiv(8192, BLOCK_SIZE);
-  // constexpr int num_blocks = cdiv(256, BLOCK_SIZE);
-  // Compute local scans in each block
-  inclusive_scan_kernel_kogge_stone_block_local<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(X, output, size, 1);
-  // Compute a scan on the last element of each block, across original blocks
-  inclusive_scan_kernel_kogge_stone_block_local<size_t, num_blocks><<<1, num_blocks>>>(output, output, size, BLOCK_SIZE);
-  // Output remaining elements with the offsets
-  inclusive_scan_update_blocks_with_offsets<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(output, size);
+  if (size == 59392) {
+    constexpr int num_blocks = cdiv(59392, BLOCK_SIZE);
+    // Compute local scans in each block
+    inclusive_scan_kernel_kogge_stone_block_local<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(X, output, size, 1);
+    // Compute a scan on the last element of each block, across original blocks
+    inclusive_scan_kernel_kogge_stone_block_local<size_t, num_blocks><<<1, num_blocks>>>(output, output, size, BLOCK_SIZE);
+    // Output remaining elements with the offsets
+    inclusive_scan_update_blocks_with_offsets<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(output, size);
+  } else if (size == 8192) {
+    constexpr int num_blocks = cdiv(8192, BLOCK_SIZE);
+    // Compute local scans in each block
+    inclusive_scan_kernel_kogge_stone_block_local<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(X, output, size, 1);
+    // Compute a scan on the last element of each block, across original blocks
+    inclusive_scan_kernel_kogge_stone_block_local<size_t, num_blocks><<<1, num_blocks>>>(output, output, size, BLOCK_SIZE);
+    // Output remaining elements with the offsets
+    inclusive_scan_update_blocks_with_offsets<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(output, size);
+  }
+}
+
+
+template<typename size_t>
+void inclusive_scan_kernel_kogge_stone_3_stage_double_buffering(const size_t* X, size_t* output, const int size) {
+  if (size == 59392) {
+    constexpr int num_blocks = cdiv(59392, BLOCK_SIZE);
+    // Compute local scans in each block
+    inclusive_scan_kernel_kogge_stone_block_local_double_buffering<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(X, output, size, 1);
+    // Compute a scan on the last element of each block, across original blocks
+    inclusive_scan_kernel_kogge_stone_block_local_double_buffering<size_t, num_blocks><<<1, num_blocks>>>(output, output, size, BLOCK_SIZE);
+    // Output remaining elements with the offsets
+    inclusive_scan_update_blocks_with_offsets<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(output, size);
+  } else if (size == 8192) {
+    constexpr int num_blocks = cdiv(8192, BLOCK_SIZE);
+    // Compute local scans in each block
+    inclusive_scan_kernel_kogge_stone_block_local_double_buffering<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(X, output, size, 1);
+    // Compute a scan on the last element of each block, across original blocks
+    inclusive_scan_kernel_kogge_stone_block_local_double_buffering<size_t, num_blocks><<<1, num_blocks>>>(output, output, size, BLOCK_SIZE);
+    // Output remaining elements with the offsets
+    inclusive_scan_update_blocks_with_offsets<size_t, BLOCK_SIZE><<<num_blocks, BLOCK_SIZE>>>(output, size);
+  }
 }

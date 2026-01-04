@@ -25,7 +25,7 @@ at::Tensor inclusive_scan(const at::Tensor& input) {
   //const int threads_per_block_coarse = BLOCK_SIZE / COARSE_FACTOR;
   //inclusive_scan_kernel_naive_single_block_coarse<float><<<1, threads_per_block_coarse>>>(input_data, output_data, size);
   inclusive_scan_kernel_kogge_stone_3_stage<float>(input_data, output_data, size);
-
+  inclusive_scan_kernel_kogge_stone_3_stage_double_buffering<float>(input_data, output_data, size);
 
   return output.to(torch::kCPU);
 }
